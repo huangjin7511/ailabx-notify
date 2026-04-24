@@ -1,0 +1,583 @@
+name: Check Strategy Holdings with Auth
+
+on:
+  schedule:
+    # 每天15:03（北京时间），对应UTC时间07:03
+    - cron: '3 7 * * *'
+  workflow_dispatch:  # 支持手动触发
+    inputs:
+      force_notify:
+        description: '强制发送通知（即使持仓未变化）'
+        required: false
+        default: 'false'
+
+env:
+  # 基础URL
+  BASE_URL: "http://app.ailabx.com"
+  # 策略ID列表
+  STRATEGY_IDS: '["591", "590"]'
+  # 登录相关
+  LOGIN_ENDPOINT: "/api/user/login"
+  HOLDINGS_ENDPOINT: "/api/strategy/holdings"
+
+jobs:
+  check-holdings:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      
+      - name: Login to get authentication token
+        id: login
+        env:
+          USERNAME: ${{ secrets.AILABX_USERNAME }}
+          PASSWORD: ${{ secrets.AILABX_PASSWORD }}
+        run: |
+          echo "开始登录获取认证token..."
+          
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+            echo "❌ 未设置登录凭证，请在仓库Secrets中配置AILABX_USERNAME和AILABX_PASSWORD"
+            exit 1
+          fi
+          
+          # 尝试登录获取token
+          # 这里需要根据实际登录接口调整
+          login_response=$(curl -s -X POST "${{ env.BASE_URL }}${{ env.LOGIN_ENDPOINT }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}" \
+            --max-time 30 || echo "{}")
+          
+          echo "登录响应: $login_response"
+          
+          # 提取token（根据实际响应结构调整）
+          token=$(echo "$login_response" | python -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    # 尝试不同的token字段
+    if 'token' in data:
+        print(data['token'])
+    elif 'data' in data and 'token' in data['data']:
+        print(data['data']['token'])
+    elif 'access_token' in data:
+        print(data['access_token'])
+    elif 'accessToken' in data:
+        print(data['accessToken'])
+    elif 'data' in data and 'access_token' in data['data']:
+        print(data['data']['access_token'])
+    else:
+        # 如果没有token，尝试获取cookie或其他认证信息
+        print('')
+except Exception as e:
+    print('')
+    sys.stderr.write(f'解析token失败: {str(e)}\n')
+")
+          
+          if [ -z "$token" ]; then
+            # 如果token为空，尝试获取cookie等其他认证方式
+            echo "尝试通过header获取认证信息..."
+            
+            # 保存登录响应header
+            headers_response=$(curl -s -i -X POST "${{ env.BASE_URL }}${{ env.LOGIN_ENDPOINT }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}" \
+              --max-time 30 | grep -i 'set-cookie\|authorization' || echo "")
+            
+            if [ -n "$headers_response" ]; then
+              echo "找到认证header: $headers_response"
+              # 提取cookie
+              cookie=$(echo "$headers_response" | grep -i 'set-cookie' | head -1 | sed 's/Set-Cookie: //i' | cut -d';' -f1)
+              if [ -n "$cookie" ]; then
+                echo "✅ 获取到cookie"
+                echo "cookie=$cookie" >> $GITHUB_OUTPUT
+                echo "auth_type=cookie" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "❌ 登录失败，无法获取认证信息"
+              echo "响应内容: $login_response"
+              exit 1
+            fi
+          else
+            echo "✅ 获取到token: ${token:0:20}..."  # 只显示前20位
+            echo "token=$token" >> $GITHUB_OUTPUT
+            echo "auth_type=token" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Fetch strategy holdings with auth
+        id: fetch-holdings
+        env:
+          AUTH_TOKEN: ${{ steps.login.outputs.token }}
+          AUTH_COOKIE: ${{ steps.login.outputs.cookie }}
+          AUTH_TYPE: ${{ steps.login.outputs.auth_type }}
+        run: |
+          echo "开始获取策略持仓数据..."
+          echo "认证类型: $AUTH_TYPE"
+          
+          # 准备认证header
+          auth_header=""
+          if [ "$AUTH_TYPE" = "token" ] && [ -n "$AUTH_TOKEN" ]; then
+            auth_header="Authorization: Bearer $AUTH_TOKEN"
+            echo "使用Token认证"
+          elif [ "$AUTH_TYPE" = "cookie" ] && [ -n "$AUTH_COOKIE" ]; then
+            auth_header="Cookie: $AUTH_COOKIE"
+            echo "使用Cookie认证"
+          else
+            echo "❌ 无有效的认证信息"
+            exit 1
+          fi
+          
+          # 解析策略ID列表
+          strategies=$(echo '${{ env.STRATEGY_IDS }}' | python -c "import json, sys; ids = json.load(sys.stdin); print(' '.join(ids))")
+          
+          all_changed=false
+          holdings_info=""
+          
+          for strategy_id in $strategies; do
+            echo -e "\n=== 获取策略 #$strategy_id 持仓 ==="
+            
+            # 方法1: 尝试通过API获取
+            echo "尝试API方式获取..."
+            
+            # 根据可能的API端点尝试获取
+            api_endpoints=(
+              "${{ env.BASE_URL }}/api/strategy/$strategy_id/holdings"
+              "${{ env.BASE_URL }}/api/strategy/holdings?strategy_id=$strategy_id"
+              "${{ env.BASE_URL }}/api/v1/strategy/$strategy_id/portfolio"
+              "${{ env.BASE_URL }}/api/strategy/detail/$strategy_id"
+            )
+            
+            holdings_data=""
+            api_success=false
+            
+            for endpoint in "${api_endpoints[@]}"; do
+              echo "尝试端点: $endpoint"
+              
+              response=$(curl -s -X GET "$endpoint" \
+                -H "$auth_header" \
+                -H "Content-Type: application/json" \
+                --max-time 30 || echo "{}")
+              
+              # 检查响应是否有效
+              if echo "$response" | python -c "import json, sys; 
+try:
+    data = json.loads(sys.stdin.read())
+    if 'data' in data or 'holdings' in data or 'portfolio' in data:
+        print('valid')
+    else:
+        print('invalid')
+except:
+    print('invalid')" | grep -q "valid"; then
+                echo "✅ 从API获取成功"
+                holdings_data="$response"
+                api_success=true
+                break
+              fi
+            done
+            
+            # 方法2: 如果API失败，尝试模拟浏览器获取页面数据
+            if [ "$api_success" = false ]; then
+              echo "API方式失败，尝试模拟浏览器获取页面..."
+              
+              # 获取页面内容
+              page_html=$(curl -s -X GET "${{ env.BASE_URL }}/#/pages/strategy/detail?id=$strategy_id" \
+                -H "$auth_header" \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --max-time 30)
+              
+              # 尝试从页面提取数据
+              holdings_data=$(echo "$page_html" | python -c "
+import json, re, sys
+
+html = sys.stdin.read()
+
+# 方法1: 查找JSON数据
+patterns = [
+    r'window\.__NUXT__\s*=\s*({.*?});',
+    r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+    r'var\s+strategyData\s*=\s*({.*?});',
+    r'\"holdings\"\s*:\s*(\[.*?\])',
+    r'\"portfolio\"\s*:\s*(\[.*?\])'
+]
+
+for pattern in patterns:
+    match = re.search(pattern, html, re.DOTALL)
+    if match:
+        try:
+            data_str = match.group(1)
+            # 尝试解析为JSON
+            data = json.loads(data_str)
+            
+            # 查找持仓数据
+            def find_holdings(obj, path=''):
+                if isinstance(obj, list):
+                    for item in obj:
+                        if isinstance(item, dict) and 'symbol' in item:
+                            return obj
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if key in ['holdings', 'portfolio', 'positions'] and isinstance(value, list):
+                            return value
+                        result = find_holdings(value, f'{path}.{key}')
+                        if result:
+                            return result
+                return None
+            
+            holdings = find_holdings(data)
+            if holdings:
+                print(json.dumps({'data': {'holdings': holdings}}, ensure_ascii=False))
+                sys.exit(0)
+        except:
+            continue
+
+# 方法2: 查找表格数据
+table_pattern = r'<table[^>]*class=[\"\'][^\"\']*holdings[^\"\']*[\"\'][^>]*>.*?</table>'
+match = re.search(table_pattern, html, re.DOTALL | re.IGNORECASE)
+if match:
+    table_html = match.group(0)
+    # 简单提取表格数据
+    import html
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(table_html, 'html.parser')
+    rows = soup.find_all('tr')
+    
+    holdings = []
+    for row in rows[1:]:  # 跳过表头
+        cols = row.find_all('td')
+        if len(cols) >= 2:
+            symbol = cols[0].get_text(strip=True)
+            name = cols[1].get_text(strip=True) if len(cols) > 1 else ''
+            holdings.append({'symbol': symbol, 'name': name})
+    
+    if holdings:
+        print(json.dumps({'data': {'holdings': holdings}}, ensure_ascii=False))
+        sys.exit(0)
+
+print('{}')
+")
+            fi
+            
+            # 处理获取到的数据
+            current_file="strategy_${strategy_id}_current.json"
+            previous_file="strategy_${strategy_id}_previous.json"
+            changes_file="strategy_${strategy_id}_changes.json"
+            
+            # 提取持仓列表
+            holdings=$(echo "$holdings_data" | python -c "
+import json, sys
+
+try:
+    data = json.loads(sys.stdin.read())
+    
+    # 多种可能的数据结构
+    holdings = []
+    
+    if 'data' in data:
+        data_obj = data['data']
+        if 'holdings' in data_obj:
+            holdings = data_obj['holdings']
+        elif 'portfolio' in data_obj:
+            holdings = data_obj['portfolio']
+        elif 'positions' in data_obj:
+            holdings = data_obj['positions']
+        elif isinstance(data_obj, list):
+            holdings = data_obj
+        elif 'symbol' in data_obj:  # 如果是单个持仓
+            holdings = [data_obj]
+    elif 'holdings' in data:
+        holdings = data['holdings']
+    elif 'portfolio' in data:
+        holdings = data['portfolio']
+    elif isinstance(data, list):
+        holdings = data
+    else:
+        # 尝试在data中查找任何包含symbol的数组
+        def find_holdings(obj):
+            if isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, dict) and 'symbol' in item:
+                        return obj
+            elif isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(value, list) and value and isinstance(value[0], dict) and 'symbol' in value[0]:
+                        return value
+                    result = find_holdings(value)
+                    if result:
+                        return result
+            return []
+        
+        holdings = find_holdings(data)
+    
+    # 清理和标准化数据
+    cleaned = []
+    for item in holdings:
+        if isinstance(item, dict):
+            clean_item = {
+                'symbol': str(item.get('symbol', item.get('code', ''))).strip(),
+                'name': str(item.get('name', item.get('stock_name', ''))).strip(),
+                'position': float(item.get('position', item.get('quantity', item.get('amount', 0)))),
+                'weight': float(item.get('weight', item.get('percentage', 0))),
+                'price': float(item.get('price', item.get('current_price', 0)))
+            }
+            # 移除空值
+            clean_item = {k: v for k, v in clean_item.items() if v or k == 'symbol'}
+            if clean_item['symbol']:  # 必须有symbol
+                cleaned.append(clean_item)
+    
+    # 按symbol排序
+    cleaned.sort(key=lambda x: x.get('symbol', ''))
+    
+    print(json.dumps(cleaned, ensure_ascii=False, indent=2))
+    
+except Exception as e:
+    sys.stderr.write(f'解析持仓数据失败: {str(e)}\n')
+    print('[]')
+")
+            
+            # 保存当前持仓
+            echo "$holdings" > "$current_file"
+            holdings_count=$(echo "$holdings" | python -c "import json, sys; data = json.loads(sys.stdin.read()); print(len(data))")
+            
+            echo "策略 #${strategy_id}: 获取到 ${holdings_count} 个持仓"
+            
+            if [ -s "$current_file" ] && [ "$holdings" != "[]" ]; then
+                # 计算哈希
+                current_hash=$(cat "$current_file" | sha256sum | cut -d' ' -f1)
+                echo "策略 #${strategy_id}: 哈希=${current_hash}"
+                
+                # 检查变化
+                has_changed="true"
+                if [ -f "$previous_file" ]; then
+                    previous_hash=$(cat "$previous_file" | sha256sum | cut -d' ' -f1)
+                    
+                    if [ "$current_hash" = "$previous_hash" ]; then
+                        has_changed="false"
+                        echo "策略 #${strategy_id}: 持仓未变化"
+                    else
+                        echo "策略 #${strategy_id}: 持仓已变化"
+                        all_changed=true
+                        
+                        # 生成变化详情
+                        python -c "
+import json, sys
+from datetime import datetime
+
+try:
+    with open('$previous_file', 'r') as f:
+        previous = json.load(f)
+    with open('$current_file', 'r') as f:
+        current = json.load(f)
+    
+    # 转换为字典便于比较
+    prev_dict = {item.get('symbol', ''): item for item in previous if item.get('symbol')}
+    curr_dict = {item.get('symbol', ''): item for item in current if item.get('symbol')}
+    
+    added = []
+    removed = []
+    changed = []
+    
+    for symbol, item in curr_dict.items():
+        if symbol and symbol not in prev_dict:
+            added.append({
+                'symbol': symbol,
+                'name': item.get('name', ''),
+                'position': item.get('position', 0),
+                'weight': item.get('weight', 0)
+            })
+    
+    for symbol, item in prev_dict.items():
+        if symbol and symbol not in curr_dict:
+            removed.append({
+                'symbol': symbol,
+                'name': item.get('name', ''),
+                'position': item.get('position', 0),
+                'weight': item.get('weight', 0)
+            })
+        elif symbol and symbol in curr_dict:
+            if prev_dict[symbol] != curr_dict[symbol]:
+                changed.append({
+                    'symbol': symbol,
+                    'previous': prev_dict[symbol],
+                    'current': curr_dict[symbol],
+                    'changes': {k: {'old': prev_dict[symbol].get(k), 'new': curr_dict[symbol].get(k)} 
+                               for k in prev_dict[symbol] if prev_dict[symbol].get(k) != curr_dict[symbol].get(k)}
+                })
+    
+    changes = {
+        'strategy_id': '$strategy_id',
+        'timestamp': datetime.now().isoformat(),
+        'added': added,
+        'removed': removed,
+        'changed': changed,
+        'summary': {
+            'added_count': len(added),
+            'removed_count': len(removed),
+            'changed_count': len(changed),
+            'previous_total': len(previous),
+            'current_total': len(current)
+        }
+    }
+    
+    with open('$changes_file', 'w') as f:
+        json.dump(changes, f, ensure_ascii=False, indent=2)
+    
+    print(f'变化详情: 新增{len(added)}, 移除{len(removed)}, 变动{len(changed)}')
+    
+except Exception as e:
+    print(f'比较持仓时出错: {str(e)}')
+    with open('$changes_file', 'w') as f:
+        json.dump({'error': str(e), 'strategy_id': '$strategy_id'}, f)
+" 2>/dev/null || echo "生成变化详情出错"
+                    fi
+                else
+                    echo "策略 #${strategy_id}: 首次获取，无历史数据"
+                    all_changed=true
+                fi
+                
+                # 更新持仓信息汇总
+                holdings_info="${holdings_info}策略 #${strategy_id}: ${holdings_count}个持仓\n"
+            else
+                echo "策略 #${strategy_id}: 获取持仓数据失败或为空"
+                holdings_info="${holdings_info}策略 #${strategy_id}: 获取失败\n"
+            fi
+          done
+          
+          # 输出结果
+          echo "all_changed=$all_changed" >> $GITHUB_OUTPUT
+          echo "holdings_info<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$holdings_info" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Send notification to WeCom
+        if: steps.fetch-holdings.outputs.all_changed == 'true' || github.event.inputs.force_notify == 'true'
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: |
+          current_time=$(date '+%Y-%m-%d %H:%M:%S')
+          
+          # 构建消息
+          if [ "${{ github.event.inputs.force_notify }}" = "true" ]; then
+            title="🔔 策略持仓监控（强制通知）"
+            change_status="📋 强制通知"
+          else
+            title="🔔 策略持仓监控通知"
+            change_status="🔄 持仓已更新"
+          fi
+          
+          # 生成变化详情文本
+          changes_summary=""
+          for changes_file in strategy_*_changes.json; do
+            if [ -f "$changes_file" ]; then
+              summary=$(python -c "
+import json
+
+try:
+    with open('$changes_file', 'r') as f:
+        changes = json.load(f)
+    
+    if 'error' in changes:
+        print(f'策略 {changes[\"strategy_id\"]}: 比较出错 - {changes[\"error\"]}')
+    elif 'summary' in changes:
+        s = changes['summary']
+        parts = []
+        if s['added_count'] > 0:
+            parts.append(f'➕{s[\"added_count\"]}')
+        if s['removed_count'] > 0:
+            parts.append(f'➖{s[\"removed_count\"]}')
+        if s['changed_count'] > 0:
+            parts.append(f'📈{s[\"changed_count\"]}')
+        
+        if parts:
+            result = f'策略 {changes[\"strategy_id\"]}: {s[\"current_total\"]}个持仓 ({" ".join(parts)})'
+        else:
+            result = f'策略 {changes[\"strategy_id\"]}: {s[\"current_total\"]}个持仓 (首次获取)'
+        
+        # 如果有具体变化，添加详情
+        if changes.get('added') or changes.get('removed'):
+            details = []
+            for item in changes.get('added', []):
+                details.append(f'新增: {item[\"symbol\"]} {item.get(\"name\", \"\")}')
+            for item in changes.get('removed', []):
+                details.append(f'移除: {item[\"symbol\"]} {item.get(\"name\", \"\")}')
+            
+            if details:
+                result += f'\n  ' + '\n  '.join(details[:5])  # 只显示前5个
+                if len(details) > 5:
+                    result += f'\n  ...等{len(details)}个变化'
+        
+        print(result)
+    else:
+        print(f'策略 {changes.get(\"strategy_id\", \"?\")}: 未知格式')
+except Exception as e:
+    print(f'读取变化文件出错: {str(e)}')
+")
+              
+              if [ -n "$summary" ]; then
+                changes_summary="${changes_summary}${summary}\n"
+              fi
+            fi
+          done
+          
+          if [ -z "$changes_summary" ]; then
+            changes_summary="无变化详情"
+          fi
+          
+          # 构建企业微信消息
+          message=$(cat << EOF
+{
+  "msgtype": "markdown",
+  "markdown": {
+    "content": "## ${title}\n\n**检查时间**: ${current_time}\n**检查结果**: ${change_status}\n\n**持仓概览**:\n${{ steps.fetch-holdings.outputs.holdings_info }}\n**变化详情**:\n${changes_summary}\n\n---\n**策略链接**:\n- [策略 #591](${{ env.BASE_URL }}/#/pages/strategy/detail?id=591)\n- [策略 #590](${{ env.BASE_URL }}/#/pages/strategy/detail?id=590)\n\n> 此通知由GitHub Actions自动发送\n> 如需调整检查频率，请修改 workflow 配置"
+  }
+}
+EOF
+)
+          
+          # 发送到企业微信
+          if [ -n "$WECOM_WEBHOOK" ]; then
+            echo "正在发送企业微信通知..."
+            response=$(curl -s -X POST "$WECOM_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d "$message")
+            
+            if echo "$response" | grep -q '"errcode":0'; then
+              echo "✅ 企业微信通知发送成功"
+            else
+              echo "❌ 企业微信通知发送失败: $response"
+              exit 1
+            fi
+          else
+            echo "⚠️ 未配置企业微信Webhook，跳过通知"
+            echo "消息内容预览:"
+            echo "$message" | python -m json.tool
+          fi
+      
+      - name: Save current holdings as previous
+        if: always()
+        run: |
+          # 保存当前持仓为下一次比较的基准
+          for current_file in strategy_*_current.json; do
+            if [ -f "$current_file" ]; then
+              strategy_id=$(echo "$current_file" | grep -oP 'strategy_\K\d+')
+              previous_file="strategy_${strategy_id}_previous.json"
+              cp "$current_file" "$previous_file"
+              echo "已保存策略 #${strategy_id} 的持仓数据"
+            fi
+          done
+      
+      - name: Clean up
+        if: always()
+        run: |
+          # 清理临时文件
+          rm -f strategy_*_current.json strategy_*_changes.json
+          echo "临时文件已清理"
